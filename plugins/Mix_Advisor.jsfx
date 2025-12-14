@@ -1,0 +1,405 @@
+desc:Mix Advisor
+
+//--------------------------------------------------
+// Sliders
+//--------------------------------------------------
+// 1: position in chain
+slider1:0<0,1,1{Input (Start of Chain),Output (End of Chain)}>Chain Position
+// 2: trim
+slider2:0<-24,24,0.1>Trim (dB)
+// 3: target RMS
+slider3:-18<-30,-6,1>Target RMS (dBFS)
+// 4: analysis window
+slider4:5<0.5,20,0.5>Analysis Window (s)
+// 5: meter mode
+slider5:2<0,2,1{Peak,RMS,VU}>Meter Mode
+// 6: reference level for meter line
+slider6:-18<-36,-6,1>Reference Level (dBFS)
+// 7: reset
+slider7:0<0,1,1{Run,Reset}>Reset / Clear History
+
+// readouts (0.1 dB precision)
+slider8:-90<-90,0,0.1>Current RMS (dBFS) [Readout]
+slider9:-90<-90,0,0.1>Current Peak (dBFS) [Readout]
+slider10:0<0,40,0.1>Crest Factor (dB) [Readout]
+
+//--------------------------------------------------
+// @init
+//--------------------------------------------------
+@init
+
+mode = slider1;   // 0=input, 1=output
+trim_lin = 1;
+
+rms_env = 0;
+peak_lin = 0;
+sample_count = 0;
+
+min_db = -60;   // floor for meter
+calc_min_db = -80;
+
+window_s = slider4;
+
+// smoothing coeff for RMS envelope
+function update_coeff()
+(
+  window_s = slider4;
+  window_s < 0.1 ? window_s = 0.1;
+  meter_coeff = exp(-1 / (window_s * srate + 0.000000000001));
+);
+
+update_coeff();
+
+// utility: linear -> dB
+function lin_to_db(x)
+(
+  x <= 0 ? calc_min_db : 20 * log10(x);
+);
+
+// utility: round to 0.1 dB for readouts
+function round_0_1(x)
+(
+  x <= calc_min_db ? calc_min_db : floor(x*10 + 0.5)/10;
+);
+
+// db -> 0..1 for meter
+function db_to_norm(db)
+(
+  db < min_db ? 0 :
+  db > 0 ? 1 :
+  (db - min_db) / (0 - min_db);
+);
+
+// string buffers for live text
+#status   = "";
+#gain_txt = "";
+#dyn_txt  = "";
+#peak_txt = "";
+
+// ---- history of gain suggestions ----
+HIST_MAX = 8;
+hist_count = 0;
+hist_write = -1;
+prev_gain_cat = 999;
+
+// arrays
+hist_start[HIST_MAX];
+hist_end[HIST_MAX];
+hist_gain_cat[HIST_MAX];
+hist_gain_diff[HIST_MAX]; // +/- dB vs target
+
+//--------------------------------------------------
+// @slider
+//--------------------------------------------------
+@slider
+
+mode = slider1;
+trim_lin = 10^(slider2/20);
+update_coeff();
+
+// reset analysis & history when slider7 toggled
+slider7 >= 0.5 ?
+(
+  rms_env = 0;
+  peak_lin = 0;
+  sample_count = 0;
+
+  hist_count = 0;
+  hist_write = -1;
+  prev_gain_cat = 999;
+
+  #status = "";
+  #gain_txt = "";
+  #dyn_txt = "";
+  #peak_txt = "";
+
+  slider7 = 0;
+  sliderchange = 1;
+);
+
+//--------------------------------------------------
+// @sample  (audio + analysis)
+//--------------------------------------------------
+@sample
+
+// we analyse the signal at this point in the chain, with trim
+// meaning differs by mode:
+//
+// Input mode  (0): apply trim first, analyse trimmed signal
+// Output mode (1): analyse raw signal, THEN apply trim
+
+mode == 0 ? (
+  // INPUT mode: trim first
+  spl0 *= trim_lin;
+  spl1 *= trim_lin;
+
+  anL = spl0;
+  anR = spl1;
+) : (
+  // OUTPUT mode: analyse first
+  anL = spl0;
+  anR = spl1;
+
+  spl0 *= trim_lin;
+  spl1 *= trim_lin;
+);
+
+// instantaneous peak from analysed signal
+absL = abs(anL);
+absR = abs(anR);
+inst_peak = absL > absR ? absL : absR;
+
+// track max peak since reset
+inst_peak > peak_lin ? peak_lin = inst_peak;
+
+// power for RMS (stereo average) from analysed signal
+power = 0.5 * (anL*anL + anR*anR);
+
+// RMS envelope (exponential smoothing)
+rms_env += (power - rms_env) * (1 - meter_coeff);
+
+// count samples
+sample_count += 1;
+
+//--------------------------------------------------
+// @block  (compute numbers + suggestions + history)
+//--------------------------------------------------
+@block
+
+// compute dB values
+rms_lin = rms_env > 0 ? sqrt(rms_env) : 0;
+rms_db  = lin_to_db(rms_lin);
+peak_db = lin_to_db(peak_lin);
+crest   = peak_db - rms_db;
+
+// signal present?
+no_signal =
+(
+  sample_count < srate * 0.2 ||
+  rms_db <= (calc_min_db + 1)
+);
+
+no_signal ?
+(
+  #status = "Waiting for signal...\nPlay some audio through this chain.";
+  #gain_txt = "";
+  #dyn_txt = "";
+  #peak_txt = "";
+  crest = 0;
+)
+:
+(
+  sprintf(#status, "Analysis window: %.1f s   Samples: %d",
+          window_s, sample_count);
+
+  // ---- gain vs target ----
+  target_rms = slider3;
+  diff = target_rms - rms_db; // + = quiet, - = hot
+  abs_diff = diff;
+  abs_diff < 0 ? abs_diff = -abs_diff;
+
+  // categories: 0=OK, 1=QUIET, -1=HOT
+  abs_diff <= 2 ?
+  (
+    gain_cat = 0;
+    gain_diff_display = 0;
+    sprintf(#gain_txt,
+      "Level is close to target (%.1f dBFS).\nNo major trim change needed.",
+      target_rms);
+  )
+  :
+  diff > 2 ?
+  (
+    gain_cat = 1;
+    gain_diff_display = diff;
+    sprintf(#gain_txt,
+      "Signal is QUIET by about %.1f dB.\nAdd roughly +%.1f dB trim or upstream gain.",
+      diff, diff);
+  )
+  :
+  (
+    gain_cat = -1;
+    gain_diff_display = -diff;
+    sprintf(#gain_txt,
+      "Signal is HOT by about %.1f dB.\nReduce trim / upstream level by about %.1f dB.",
+      -diff, -diff);
+  );
+
+  // ---- dynamics suggestion ----
+  crest < 0 ? crest = 0;
+
+  crest > 18 ?
+    sprintf(#dyn_txt,
+      "Dynamics: VERY WIDE (crest ≈ %.1f dB).\nTry light compression (2:1–3:1) with 2–4 dB gain reduction on peaks.",
+      crest)
+  : crest > 12 ?
+    sprintf(#dyn_txt,
+      "Dynamics: HEALTHY (crest ≈ %.1f dB).\nMusical and dynamic. Add compression only if you want more control/glue.",
+      crest)
+  : crest > 8 ?
+    sprintf(#dyn_txt,
+      "Dynamics: MODERATE / already somewhat compressed (crest ≈ %.1f dB).\nBe cautious adding more compression/limiting.",
+      crest)
+  :
+    sprintf(#dyn_txt,
+      "Dynamics: TIGHT / heavily compressed (crest ≈ %.1f dB).\nFurther limiting may sound squashed or fatiguing.",
+      crest);
+
+  // ---- peak/headroom suggestion ----
+  peak_db > -1 ?
+    sprintf(#peak_txt,
+      "Peaks: VERY HIGH (peak ≈ %.1f dBFS).\nAlmost no headroom. Avoid more level before limiting.",
+      peak_db)
+  : peak_db > -4 ?
+    sprintf(#peak_txt,
+      "Peaks: HIGH (peak ≈ %.1f dBFS).\nOK for a master, a bit hot for a pre-master mix.",
+      peak_db)
+  : peak_db > -8 ?
+    sprintf(#peak_txt,
+      "Peaks: COMFORTABLE (peak ≈ %.1f dBFS).\nGood headroom for mastering and bus processing.",
+      peak_db)
+  :
+    sprintf(#peak_txt,
+      "Peaks: LOW (peak ≈ %.1f dBFS).\nLots of headroom; you can safely raise overall level later.",
+      peak_db);
+
+  // ---- history tracking (gain suggestion over time) ----
+  // record a new segment when gain_cat changes
+  gain_cat != prev_gain_cat ?
+  (
+    // close previous segment
+    hist_write >= 0 && hist_count > 0 ?
+      hist_end[hist_write] = play_position;
+
+    // open new segment
+    hist_write += 1;
+    hist_write >= HIST_MAX ? hist_write = 0;
+
+    hist_start[hist_write] = play_position;
+    hist_end[hist_write]   = -1; // open
+    hist_gain_cat[hist_write]  = gain_cat;
+    hist_gain_diff[hist_write] = gain_diff_display;
+
+    hist_count < HIST_MAX ? hist_count += 1;
+    prev_gain_cat = gain_cat;
+  );
+);
+
+// update readout sliders (rounded)
+slider8  = round_0_1(rms_db);
+slider9  = round_0_1(peak_db);
+slider10 = round_0_1(crest);
+sliderchange = 1;
+
+// decay stored peak
+peak_lin *= 0.999;
+
+//--------------------------------------------------
+// @gfx  (graphical meter + text + history)
+//--------------------------------------------------
+@gfx 560 360
+
+gfx_clear = 0x202020;
+gfx_set(1,1,1);
+
+// header
+gfx_x = 8; gfx_y = 8;
+mode == 0 ?
+  gfx_printf("Unified Mix Advisor  [Input / Start of Chain]\n") :
+  gfx_printf("Unified Mix Advisor  [Output / End of Chain]\n");
+
+// numeric readout
+gfx_x = 8; gfx_y += 16;
+gfx_printf("RMS: %.1f dBFS   Peak: %.1f dBFS   Crest: %.1f dB",
+           rms_db, peak_db, crest);
+
+//----------- Graphical meter -----------
+meter_mode = slider5;
+ref_level  = slider6;
+
+// decide which value to visualize
+meter_mode == 0 ? meter_val_db = peak_db :
+                  meter_val_db = rms_db;
+
+norm_val = db_to_norm(meter_val_db);
+ref_norm = db_to_norm(ref_level);
+
+// meter area
+margin = 8;
+meter_x = margin;
+meter_y = gfx_y + 12;
+meter_w = gfx_w - margin*2;
+meter_h = 20;
+
+// slot
+gfx_set(0.1,0.1,0.1);
+gfx_rect(meter_x, meter_y, meter_w, meter_h);
+
+// fill
+meter_mode == 0 ? gfx_set(0.8,0.3,0.3) : gfx_set(0,0.7,0);
+gfx_rect(meter_x, meter_y, meter_w * norm_val, meter_h);
+
+// reference line
+gfx_set(1,1,0);
+ref_x = meter_x + meter_w * ref_norm;
+gfx_line(ref_x, meter_y, ref_x, meter_y + meter_h);
+gfx_x = ref_x - 20; gfx_y = meter_y + meter_h + 2;
+gfx_printf("Ref %.0f", ref_level);
+
+//----------- Live text suggestions -----------
+gfx_set(1,1,1);
+gfx_x = 8; gfx_y = meter_y + meter_h + 24;
+gfx_printf(#status);
+
+gfx_x = 8; gfx_y += 24;
+gfx_printf("Gain / Level Suggestion:");
+gfx_x = 8; gfx_y += 16;
+gfx_printf(#gain_txt);
+
+gfx_x = 8; gfx_y += 24;
+gfx_printf("Dynamics Suggestion:");
+gfx_x = 8; gfx_y += 16;
+gfx_printf(#dyn_txt);
+
+gfx_x = 8; gfx_y += 24;
+gfx_printf("Peak / Headroom Suggestion:");
+gfx_x = 8; gfx_y += 16;
+gfx_printf(#peak_txt);
+
+//----------- History log (last few segments) -----------
+gfx_x = 8; gfx_y += 26;
+gfx_printf("Recent Level States (by time):\n");
+
+hist_show = hist_count;
+hist_show > HIST_MAX ? hist_show = HIST_MAX;
+
+i = 0;
+loop(hist_show,
+  idx = hist_write - i;
+  idx < 0 ? idx += HIST_MAX;
+
+  start_t = hist_start[idx];
+  end_t   = hist_end[idx];
+  end_t < 0 || end_t < start_t ? end_t = play_position;
+
+  // format times
+  s_min = floor(start_t/60); s_sec = floor(start_t - s_min*60);
+  e_min = floor(end_t/60);   e_sec = floor(end_t - e_min*60);
+
+  gain_cat = hist_gain_cat[idx];
+  diffdB   = hist_gain_diff[idx];
+
+  gfx_x = 8;
+  gain_cat == 0 ?
+    gfx_printf(" [%02d:%02d - %02d:%02d] Level OK (near target)\n",
+               s_min, s_sec, e_min, e_sec)
+  : gain_cat > 0 ?
+    gfx_printf(" [%02d:%02d - %02d:%02d] QUIET (needs ≈ +%.1f dB)\n",
+               s_min, s_sec, e_min, e_sec, diffdB)
+  :
+    gfx_printf(" [%02d:%02d - %02d:%02d] HOT (reduce ≈ %.1f dB)\n",
+               s_min, s_sec, e_min, e_sec, diffdB);
+
+  i += 1;
+);
+
